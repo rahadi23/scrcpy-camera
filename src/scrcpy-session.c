@@ -2057,13 +2057,10 @@ static SCRCPY_THREAD_API scrcpy_session_worker(void *opaque)
 		if (!scrcpy_command_step(session, "Configure adb forward", command))
 			goto cleanup_winsock;
 
-		snprintf(command, sizeof(command),
-			 "%s -s %s shell CLASSPATH=/data/local/tmp/scrcpy-server.jar app_process / "
-			 "com.genymobile.scrcpy.Server %s scid=%08x tunnel_forward=true audio=%s control=%s "
-			 "video_codec=%s",
-			 session->adb_path, session->device_serial, session->scrcpy_version, session->scid,
-			 session->audio_enabled ? "true" : "false", session->camera_controls_enabled ? "true" : "false",
-			 session->video_codec);
+		/* Server options (everything after the version), assembled into the full command below */
+		snprintf(command, sizeof(command), "scid=%08x tunnel_forward=true audio=%s control=%s video_codec=%s",
+			 session->scid, session->audio_enabled ? "true" : "false",
+			 session->camera_controls_enabled ? "true" : "false", session->video_codec);
 
 		{
 			size_t len = strlen(command);
@@ -2145,8 +2142,31 @@ static SCRCPY_THREAD_API scrcpy_session_worker(void *opaque)
 			}
 		}
 
-		obs_log(LOG_INFO, "scrcpy server command: ...%s",
-			strlen(command) > 80 ? command + strlen(command) - 80 : command);
+		{
+			char options[sizeof(command)];
+			memcpy(options, command, sizeof(options));
+			if (strcmp(session->scrcpy_version, SCRCPY_CAMCTL_SERVER_VERSION) == 0) {
+				/*
+				 * The camera controls server accepts its options in the environment. Some devices
+				 * read the camera client command line into a fixed-size buffer: on a Galaxy Note10+,
+				 * a command line longer than ~256 bytes crashes the server when the camera is opened.
+				 * The outer double quotes are removed by the local process launcher (CreateProcess
+				 * argument parsing, or /bin/sh -c), the single quotes by the device shell.
+				 */
+				snprintf(command, sizeof(command),
+					 "%s -s %s shell \"SCRCPY_SERVER_OPTIONS='%s'\" "
+					 "CLASSPATH=/data/local/tmp/scrcpy-server.jar app_process / "
+					 "com.genymobile.scrcpy.Server %s",
+					 session->adb_path, session->device_serial, options, session->scrcpy_version);
+			} else {
+				snprintf(command, sizeof(command),
+					 "%s -s %s shell CLASSPATH=/data/local/tmp/scrcpy-server.jar app_process / "
+					 "com.genymobile.scrcpy.Server %s %s",
+					 session->adb_path, session->device_serial, session->scrcpy_version, options);
+			}
+		}
+
+		obs_log(LOG_INFO, "scrcpy server command: %s", command);
 		if (!scrcpy_command_fire_and_forget(session, "Start scrcpy app_process server", command))
 			goto cleanup_winsock;
 
