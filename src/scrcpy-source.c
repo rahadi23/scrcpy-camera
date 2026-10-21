@@ -17,10 +17,13 @@
  */
 
 #include <obs-module.h>
+#include <util/dstr.h>
 #include <util/platform.h>
+#include <util/threading.h>
 
 #include <plugin-support.h>
 
+#include "camera-controls-props.h"
 #include "scrcpy-session.h"
 #include "scrcpy-source.h"
 
@@ -69,7 +72,9 @@ static const char *const DEFAULT_ADB_PATH = "adb.exe";
 static const char *const DEFAULT_ADB_PATH = "adb";
 #define ADB_FILTER "All Files (*.*)"
 #endif
-static const char *const DEFAULT_SCRCPY_VERSION = "5.0.1";
+/* The camera controls server is bundled with the plugin (data/scrcpy-server-camctl.jar) */
+static const char *const DEFAULT_SCRCPY_VERSION = SCRCPY_CAMCTL_SERVER_VERSION;
+#define CAMCTL_SERVER_JAR_FILE "scrcpy-server-camctl.jar"
 
 /*
  * Placeholder entries shown in the ADB device combo. The combo is editable and
@@ -164,6 +169,16 @@ struct scrcpy_source {
 	bool active;
 	bool restart_pending;
 	uint64_t restart_after_ns;
+
+	/* Live camera controls. Only a change of the session settings (session_signature) restarts the stream; camera
+	 * controls are sent to the running session. */
+	bool camera_controls_enabled;
+	struct scrcpy_camera_controls camera_controls;
+	char *session_signature;
+	/* What the device reported, written by the session control thread */
+	pthread_mutex_t camctl_mutex;
+	struct camctl_device_info camctl_info;
+	volatile bool camctl_caps_changed;
 };
 
 static void scrcpy_source_update(void *data, obs_data_t *settings);
@@ -205,6 +220,7 @@ static void *scrcpy_source_create(obs_data_t *settings, obs_source_t *source)
 {
 	struct scrcpy_source *context = bzalloc(sizeof(*context));
 	context->source = source;
+	pthread_mutex_init(&context->camctl_mutex, NULL);
 	context->session = scrcpy_session_create();
 	context->frame_width = 0;
 	context->frame_height = 0;
@@ -235,7 +251,9 @@ static void scrcpy_source_destroy(void *data)
 	bfree(context->camera_size);
 	bfree(context->audio_source);
 	bfree(context->audio_codec);
+	bfree(context->session_signature);
 	scrcpy_session_destroy(context->session);
+	pthread_mutex_destroy(&context->camctl_mutex);
 	bfree(context);
 }
 
@@ -371,11 +389,56 @@ static void scrcpy_source_update(void *data, obs_data_t *settings)
 		}
 	}
 
+	/*
+	 * Live camera controls need the forked server, which is bundled with the plugin: when its version is selected,
+	 * the bundled jar is used (the jar path setting is for the upstream servers).
+	 */
+	bool was_camera_controls_enabled = context->camera_controls_enabled;
+	context->camera_controls_enabled = is_camera && strcmp(context->scrcpy_version, SCRCPY_CAMCTL_SERVER_VERSION) == 0;
+	if (context->camera_controls_enabled != was_camera_controls_enabled)
+		obs_source_update_properties(context->source); /* show or hide the camera controls */
+	if (strcmp(context->scrcpy_version, SCRCPY_CAMCTL_SERVER_VERSION) == 0) {
+		char *bundled_jar = obs_module_file(CAMCTL_SERVER_JAR_FILE);
+		if (bundled_jar) {
+			bfree(context->server_jar_path);
+			context->server_jar_path = bundled_jar;
+		} else {
+			obs_log(LOG_WARNING, "bundled %s not found, using '%s'", CAMCTL_SERVER_JAR_FILE,
+				context->server_jar_path);
+		}
+	}
+
+	if (context->camera_controls_enabled) {
+		pthread_mutex_lock(&context->camctl_mutex);
+		struct scrcpy_camera_caps caps = context->camctl_info.caps;
+		bool has_caps = context->camctl_info.has_caps;
+		pthread_mutex_unlock(&context->camctl_mutex);
+		camctl_controls_from_settings(settings, has_caps ? &caps : NULL, &context->camera_controls);
+		/* Applied live if connected, and used as startup parameters on the next connection */
+		scrcpy_session_set_camera_controls(context->session, &context->camera_controls);
+	}
+
+	/* Only the session settings require a restart: camera controls are applied live */
+	struct dstr signature = {0};
+	dstr_printf(&signature, "%s|%s|%s|%s|%s|%s|%s|%s|%hu|%u|%hu|%hu|%hu|%d|%d|%d|%s|%s|%u|%u|%d",
+		    context->adb_path, context->device_serial, context->server_jar_path, context->scrcpy_version,
+		    context->video_codec, context->video_source, context->camera_id, context->camera_size,
+		    context->local_port, context->video_bit_rate, context->max_size, context->max_fps,
+		    context->camera_fps, context->camera_high_speed, context->hw_decoding, context->audio_enabled,
+		    context->audio_source, context->audio_codec, context->audio_bit_rate,
+		    (unsigned)context->low_latency_level, context->camera_controls_enabled);
+	bool session_changed = !context->session_signature || strcmp(context->session_signature, signature.array) != 0;
+	bfree(context->session_signature);
+	context->session_signature = signature.array; /* ownership transferred */
+
+	if (!session_changed)
+		return;
+
 	obs_log(LOG_INFO,
-		"scrcpy source updated: device='%s', source=%s, fps=%s, codec=%s, bitrate=%uMbps, max_size=%hu, camera_size=%s, audio=%s(%s), low_latency=%u",
+		"scrcpy source updated: device='%s', source=%s, fps=%s, codec=%s, bitrate=%uMbps, max_size=%hu, camera_size=%s, audio=%s(%s), low_latency=%u, camera_controls=%s",
 		context->device_serial, context->video_source, fps_desc, context->video_codec, (uint32_t)video_bit_rate,
 		context->max_size, context->camera_size, context->audio_enabled ? "on" : "off", context->audio_codec,
-		(unsigned)context->low_latency_level);
+		(unsigned)context->low_latency_level, context->camera_controls_enabled ? "on" : "off");
 
 	if (scrcpy_source_is_in_use(context)) {
 		context->restart_pending = true;
@@ -412,6 +475,7 @@ static void scrcpy_source_defaults(obs_data_t *settings)
 	/* Default Low: unbuffered async output plus AV_CODEC_FLAG_LOW_DELAY, which
 	 * keeps latency flat without touching decode quality. */
 	obs_data_set_default_int(settings, SETTING_LOW_LATENCY, 1);
+	camctl_props_defaults(settings);
 }
 
 static void scrcpy_frame_rate_list_fill(obs_property_t *list, bool is_camera)
@@ -435,6 +499,9 @@ static bool scrcpy_video_source_changed(obs_properties_t *props, obs_property_t 
 	obs_property_set_visible(cam_id_prop, is_camera);
 	obs_property_t *cam_size_prop = obs_properties_get(props, SETTING_CAMERA_SIZE);
 	obs_property_set_visible(cam_size_prop, is_camera);
+	obs_property_t *cam_controls_group = obs_properties_get(props, "cam_controls");
+	if (cam_controls_group)
+		obs_property_set_visible(cam_controls_group, is_camera);
 	obs_property_t *frame_rate_prop = obs_properties_get(props, SETTING_FRAME_RATE);
 	if (frame_rate_prop) {
 		scrcpy_frame_rate_list_fill(frame_rate_prop, is_camera);
@@ -467,6 +534,47 @@ static bool scrcpy_audio_enabled_changed(obs_properties_t *props, obs_property_t
 	obs_property_t *bitrate_prop = obs_properties_get(props, SETTING_AUDIO_BIT_RATE);
 	obs_property_set_visible(bitrate_prop, enabled);
 	return true;
+}
+
+static bool scrcpy_source_get_camctl_info(void *data, struct camctl_device_info *info)
+{
+	struct scrcpy_source *context = data;
+	if (!context)
+		return false;
+
+	pthread_mutex_lock(&context->camctl_mutex);
+	*info = context->camctl_info;
+	pthread_mutex_unlock(&context->camctl_mutex);
+	return true;
+}
+
+static void scrcpy_source_camctl_af_trigger(void *data)
+{
+	struct scrcpy_source *context = data;
+	if (context && context->session)
+		scrcpy_session_camera_af_trigger(context->session, SCRCPY_CAMERA_AF_TRIGGER_START);
+}
+
+static void scrcpy_source_on_camera_caps(void *opaque, const struct scrcpy_camera_caps *caps)
+{
+	struct scrcpy_source *context = opaque;
+
+	pthread_mutex_lock(&context->camctl_mutex);
+	context->camctl_info.caps = *caps;
+	context->camctl_info.has_caps = true;
+	pthread_mutex_unlock(&context->camctl_mutex);
+	/* Handled in the tick: the controls depend on the caps (EV step), and the properties must be rebuilt */
+	os_atomic_set_bool(&context->camctl_caps_changed, true);
+}
+
+static void scrcpy_source_on_camera_state(void *opaque, const struct scrcpy_camera_state *state)
+{
+	struct scrcpy_source *context = opaque;
+
+	pthread_mutex_lock(&context->camctl_mutex);
+	context->camctl_info.state = *state;
+	context->camctl_info.has_state = true;
+	pthread_mutex_unlock(&context->camctl_mutex);
 }
 
 static obs_properties_t *scrcpy_source_properties(void *unused)
@@ -528,15 +636,19 @@ static obs_properties_t *scrcpy_source_properties(void *unused)
 	 */
 	obs_property_t *version_list = obs_properties_add_list(props, SETTING_SCRCPY_VERSION, "scrcpy protocol version",
 							       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
-	obs_property_list_add_string(version_list, "5.0.1 (recommended)", "5.0.1");
+	obs_property_list_add_string(version_list, SCRCPY_CAMCTL_SERVER_VERSION " (bundled, camera controls)",
+				     SCRCPY_CAMCTL_SERVER_VERSION);
+	obs_property_list_add_string(version_list, "5.0.1", "5.0.1");
 	obs_property_list_add_string(version_list, "5.0", "5.0");
 	obs_property_list_add_string(version_list, "4.1", "4.1");
 	obs_property_list_add_string(version_list, "4.0", "4.0");
 	obs_property_set_long_description(
 		version_list,
-		"Must match the scrcpy-server.jar above exactly. Download scrcpy-server-v5.0.1 from the scrcpy "
-		"v5.0.1 release page and rename it to scrcpy-server.jar. If this does not match the jar, the "
-		"server refuses the connection with \"The server version (X) does not match the client (Y)\".");
+		SCRCPY_CAMCTL_SERVER_VERSION " uses the server bundled with the plugin, which adds live camera controls "
+		"(the jar path above is then ignored). The other versions must match the scrcpy-server.jar above "
+		"exactly: download scrcpy-server-vX from the scrcpy release page and rename it to scrcpy-server.jar. "
+		"If this does not match the jar, the server refuses the connection with \"The server version (X) does "
+		"not match the client (Y)\".");
 
 	vsource_list = obs_properties_add_list(props, SETTING_VIDEO_SOURCE, "Video source", OBS_COMBO_TYPE_LIST,
 					       OBS_COMBO_FORMAT_STRING);
@@ -565,6 +677,17 @@ static obs_properties_t *scrcpy_source_properties(void *unused)
 	obs_property_list_add_string(cam_id_prop, "3", "3");
 
 	obs_properties_add_text(props, SETTING_CAMERA_SIZE, "Camera Size", OBS_TEXT_DEFAULT);
+
+	{
+		struct camctl_device_info info = {0};
+		bool enabled = false;
+		if (context) {
+			scrcpy_source_get_camctl_info(context, &info);
+			enabled = context->camera_controls_enabled;
+		}
+		camctl_props_add(props, enabled, context ? &info : NULL, context, scrcpy_source_camctl_af_trigger,
+				 scrcpy_source_get_camctl_info);
+	}
 
 	codec_list = obs_properties_add_list(props, SETTING_VIDEO_CODEC, "Video codec", OBS_COMBO_TYPE_LIST,
 					     OBS_COMBO_FORMAT_STRING);
@@ -621,7 +744,7 @@ static obs_properties_t *scrcpy_source_properties(void *unused)
 
 static void scrcpy_source_start_session(struct scrcpy_source *context)
 {
-	struct scrcpy_session_config config;
+	struct scrcpy_session_config config = {0};
 
 	if (!context || !context->session)
 		return;
@@ -653,6 +776,17 @@ static void scrcpy_source_start_session(struct scrcpy_source *context)
 	config.on_frame_opaque = context;
 	config.on_audio = scrcpy_source_on_audio;
 	config.on_audio_opaque = context;
+	config.camera_controls_enabled = context->camera_controls_enabled;
+	config.camera_controls = context->camera_controls;
+	config.on_camera_caps = scrcpy_source_on_camera_caps;
+	config.on_camera_state = scrcpy_source_on_camera_state;
+	config.on_camera_opaque = context;
+
+	/* The camera may differ from the previous session: forget what the previous one reported */
+	pthread_mutex_lock(&context->camctl_mutex);
+	context->camctl_info.has_caps = false;
+	context->camctl_info.has_state = false;
+	pthread_mutex_unlock(&context->camctl_mutex);
 
 	if (scrcpy_session_start(context->session, &config) != 0)
 		obs_log(LOG_WARNING, "unable to start scrcpy bootstrap session");
@@ -718,7 +852,26 @@ static void scrcpy_source_tick(void *data, float seconds)
 {
 	UNUSED_PARAMETER(seconds);
 	struct scrcpy_source *context = data;
-	if (!context || !context->restart_pending)
+	if (!context)
+		return;
+
+	if (os_atomic_load_bool(&context->camctl_caps_changed)) {
+		os_atomic_set_bool(&context->camctl_caps_changed, false);
+		if (context->camera_controls_enabled) {
+			/* The exposure compensation can only be sent once the EV step is known */
+			obs_data_t *settings = obs_source_get_settings(context->source);
+			struct camctl_device_info info;
+			scrcpy_source_get_camctl_info(context, &info);
+			camctl_controls_from_settings(settings, info.has_caps ? &info.caps : NULL,
+						      &context->camera_controls);
+			scrcpy_session_set_camera_controls(context->session, &context->camera_controls);
+			obs_data_release(settings);
+		}
+		/* Rebuild the properties (ranges and available modes) if they are shown */
+		obs_source_update_properties(context->source);
+	}
+
+	if (!context->restart_pending)
 		return;
 
 	if (os_gettime_ns() < context->restart_after_ns)

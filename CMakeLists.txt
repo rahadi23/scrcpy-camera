@@ -48,7 +48,12 @@ endif()
 
 target_sources(
   ${CMAKE_PROJECT_NAME}
-  PRIVATE src/plugin-main.c src/scrcpy-session.c src/scrcpy-source.c src/camera-protocol.c
+  PRIVATE
+    src/plugin-main.c
+    src/scrcpy-session.c
+    src/scrcpy-source.c
+    src/camera-protocol.c
+    src/camera-controls-props.c
 )
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})

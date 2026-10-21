@@ -30,6 +30,7 @@
 #include <plugin-support.h>
 
 #include <util/platform.h>
+#include <util/threading.h>
 
 #include <stdbool.h>
 #include <stdio.h>
@@ -121,20 +122,35 @@ struct scrcpy_session {
 	uint64_t next_audio_ts;
 	char socket_name[64];
 
+	/* Camera controls (fork extension). The desired controls are shared with the OBS threads under
+	 * controls_mutex; the control thread sends them when controls_dirty is set. */
+	bool camera_controls_enabled;
+	scrcpy_session_camera_caps_callback on_camera_caps;
+	scrcpy_session_camera_state_callback on_camera_state;
+	void *on_camera_opaque;
+	pthread_mutex_t controls_mutex;
+	struct scrcpy_camera_controls camera_controls;
+	bool controls_dirty;
+	uint8_t pending_af_trigger;
+
 #ifdef _WIN32
 	HANDLE worker_thread;
 	HANDLE audio_thread;
+	HANDLE control_thread;
 	HANDLE server_process;
 	SOCKET video_socket;
 	SOCKET audio_socket;
+	SOCKET control_socket;
 	volatile LONG stop_requested;
 	volatile LONG running;
 #else
 	pthread_t worker_thread;
 	pthread_t audio_thread;
+	pthread_t control_thread;
 	pid_t server_pid;
 	int video_socket;
 	int audio_socket;
+	int control_socket;
 	volatile int stop_requested;
 	volatile int running;
 #endif
@@ -142,6 +158,9 @@ struct scrcpy_session {
 
 static SCRCPY_THREAD_API scrcpy_session_worker(void *opaque);
 static SCRCPY_THREAD_API scrcpy_audio_worker(void *opaque);
+static SCRCPY_THREAD_API scrcpy_control_worker(void *opaque);
+static bool scrcpy_open_control_socket(struct scrcpy_session *session);
+static void scrcpy_join_control_thread(struct scrcpy_session *session);
 static bool scrcpy_command_step(struct scrcpy_session *session, const char *step, const char *command_line);
 static bool scrcpy_command_fire_and_forget(struct scrcpy_session *session, const char *step, const char *command_line);
 static bool scrcpy_run_process(struct scrcpy_session *session, const char *step, const char *command_line,
@@ -205,12 +224,52 @@ static void scrcpy_copy_config(struct scrcpy_session *session, const struct scrc
 	session->on_frame_opaque = config->on_frame_opaque;
 	session->on_audio = config->on_audio;
 	session->on_audio_opaque = config->on_audio_opaque;
+	session->camera_controls_enabled = config->camera_controls_enabled && strcmp(session->video_source, "camera") == 0;
+	session->on_camera_caps = config->on_camera_caps;
+	session->on_camera_state = config->on_camera_state;
+	session->on_camera_opaque = config->on_camera_opaque;
+	pthread_mutex_lock(&session->controls_mutex);
+	session->camera_controls = config->camera_controls;
+	session->controls_dirty = false;
+	session->pending_af_trigger = 0;
+	pthread_mutex_unlock(&session->controls_mutex);
 	snprintf(session->socket_name, sizeof(session->socket_name), "scrcpy_%08x", session->scid);
 }
 
 struct scrcpy_session *scrcpy_session_create(void)
 {
-	return bzalloc(sizeof(struct scrcpy_session));
+	struct scrcpy_session *session = bzalloc(sizeof(struct scrcpy_session));
+	if (pthread_mutex_init(&session->controls_mutex, NULL) != 0) {
+		bfree(session);
+		return NULL;
+	}
+	session->video_socket = INVALID_SOCKET;
+	session->audio_socket = INVALID_SOCKET;
+	session->control_socket = INVALID_SOCKET;
+	return session;
+}
+
+void scrcpy_session_set_camera_controls(struct scrcpy_session *session, const struct scrcpy_camera_controls *controls)
+{
+	if (!session || !controls)
+		return;
+
+	pthread_mutex_lock(&session->controls_mutex);
+	if (!scrcpy_camera_controls_equal(&session->camera_controls, controls)) {
+		session->camera_controls = *controls;
+		session->controls_dirty = true;
+	}
+	pthread_mutex_unlock(&session->controls_mutex);
+}
+
+void scrcpy_session_camera_af_trigger(struct scrcpy_session *session, uint8_t action)
+{
+	if (!session)
+		return;
+
+	pthread_mutex_lock(&session->controls_mutex);
+	session->pending_af_trigger = action;
+	pthread_mutex_unlock(&session->controls_mutex);
 }
 
 void scrcpy_session_destroy(struct scrcpy_session *session)
@@ -230,6 +289,7 @@ void scrcpy_session_destroy(struct scrcpy_session *session)
 	bfree(session->camera_size);
 	bfree(session->audio_source);
 	bfree(session->audio_codec);
+	pthread_mutex_destroy(&session->controls_mutex);
 	bfree(session);
 }
 
@@ -356,6 +416,12 @@ static void scrcpy_close_stream_handles(struct scrcpy_session *session)
 		shutdown(session->audio_socket, SD_BOTH);
 		closesocket(session->audio_socket);
 		session->audio_socket = INVALID_SOCKET;
+	}
+
+	if (session->control_socket != INVALID_SOCKET) {
+		shutdown(session->control_socket, SD_BOTH);
+		closesocket(session->control_socket);
+		session->control_socket = INVALID_SOCKET;
 	}
 
 #ifdef _WIN32
@@ -1742,6 +1808,203 @@ static SCRCPY_THREAD_API scrcpy_audio_worker(void *opaque)
 	return 0;
 }
 
+static bool scrcpy_open_control_socket(struct scrcpy_session *session)
+{
+	struct sockaddr_in addr;
+	int attempt;
+
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(session->local_port);
+	addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+	for (attempt = 0; attempt < 10; ++attempt) {
+		if (scrcpy_should_stop(session))
+			return false;
+
+		SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+		if (sock == INVALID_SOCKET)
+			return false;
+
+		if (connect(sock, (const struct sockaddr *)&addr, sizeof(addr)) == 0) {
+			int nodelay = 1;
+			setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (const char *)&nodelay, sizeof(nodelay));
+#ifdef SO_NOSIGPIPE
+			int nosigpipe = 1;
+			setsockopt(sock, SOL_SOCKET, SO_NOSIGPIPE, (const char *)&nosigpipe, sizeof(nosigpipe));
+#endif
+			session->control_socket = sock;
+			obs_log(LOG_DEBUG, "connected to scrcpy control TCP port %hu", session->local_port);
+			return true;
+		}
+
+		closesocket(sock);
+		Sleep(100);
+	}
+
+	obs_log(LOG_ERROR, "unable to connect to local scrcpy control socket on tcp:%hu", session->local_port);
+	return false;
+}
+
+static void scrcpy_join_control_thread(struct scrcpy_session *session)
+{
+	/* Unblock the control thread (the socket itself is closed afterwards by scrcpy_close_stream_handles()) */
+	if (session->control_socket != INVALID_SOCKET)
+		shutdown(session->control_socket, SD_BOTH);
+
+	if (!session->control_thread)
+		return;
+#ifdef _WIN32
+	WaitForSingleObject(session->control_thread, INFINITE);
+	CloseHandle(session->control_thread);
+#else
+	pthread_join(session->control_thread, NULL);
+#endif
+	session->control_thread = 0;
+}
+
+static bool scrcpy_send_all(SOCKET sock, const uint8_t *data, size_t len)
+{
+#ifdef MSG_NOSIGNAL
+	/* A send() on a socket closed by the server must not raise SIGPIPE (it would kill OBS) */
+	const int flags = MSG_NOSIGNAL;
+#else
+	const int flags = 0; /* Windows has no SIGPIPE; macOS uses SO_NOSIGPIPE, set on the socket */
+#endif
+	while (len > 0) {
+		int sent = send(sock, (const char *)data, (int)len, flags);
+		if (sent <= 0)
+			return false;
+		data += sent;
+		len -= (size_t)sent;
+	}
+	return true;
+}
+
+/* Wait until the socket is readable, for at most timeout_ms. Return 1 if readable, 0 on timeout, -1 on error. */
+static int scrcpy_wait_readable(SOCKET sock, int timeout_ms)
+{
+	fd_set read_fds;
+	struct timeval tv;
+
+	FD_ZERO(&read_fds);
+	FD_SET(sock, &read_fds);
+	tv.tv_sec = 0;
+	tv.tv_usec = timeout_ms * 1000;
+#ifdef _WIN32
+	int r = select(0, &read_fds, NULL, NULL, &tv);
+#else
+	int r = select(sock + 1, &read_fds, NULL, NULL, &tv);
+#endif
+	if (r < 0)
+		return -1;
+	return r > 0 ? 1 : 0;
+}
+
+#define SCRCPY_CONTROL_SEND_INTERVAL_NS 50000000ULL /* coalesce slider drags: at most 20 snapshots per second */
+#define SCRCPY_CONTROL_POLL_MS 20
+
+/*
+ * Camera controls thread: sends the desired controls (only the latest snapshot, at most every
+ * SCRCPY_CONTROL_SEND_INTERVAL_NS) and AF triggers, and reads the device messages. The device messages must always be
+ * read, otherwise the server message queue fills up.
+ */
+static SCRCPY_THREAD_API scrcpy_control_worker(void *opaque)
+{
+	struct scrcpy_session *session = opaque;
+	SOCKET sock = session->control_socket;
+	uint8_t buffer[4096];
+	size_t buffered = 0;
+	uint64_t last_send_ns = 0;
+	struct scrcpy_device_msg *msg = bzalloc(sizeof(*msg));
+
+	obs_log(LOG_INFO, "scrcpy camera control thread started");
+
+	while (!scrcpy_should_stop(session)) {
+		/* Send */
+		struct scrcpy_camera_controls controls;
+		bool send_controls = false;
+		uint8_t af_trigger;
+		uint64_t now = os_gettime_ns();
+
+		pthread_mutex_lock(&session->controls_mutex);
+		if (session->controls_dirty && now - last_send_ns >= SCRCPY_CONTROL_SEND_INTERVAL_NS) {
+			controls = session->camera_controls;
+			session->controls_dirty = false;
+			send_controls = true;
+		}
+		af_trigger = session->pending_af_trigger;
+		session->pending_af_trigger = 0;
+		pthread_mutex_unlock(&session->controls_mutex);
+
+		if (send_controls) {
+			uint8_t out[SCRCPY_CAMERA_CONTROLS_MSG_SIZE];
+			size_t out_len = scrcpy_camera_controls_serialize(&controls, out);
+			if (!scrcpy_send_all(sock, out, out_len))
+				break;
+			last_send_ns = now;
+		}
+		if (af_trigger) {
+			uint8_t out[SCRCPY_CAMERA_AF_TRIGGER_MSG_SIZE];
+			size_t out_len = scrcpy_camera_af_trigger_serialize(af_trigger, out);
+			if (!scrcpy_send_all(sock, out, out_len))
+				break;
+		}
+
+		/* Receive */
+		int readable = scrcpy_wait_readable(sock, SCRCPY_CONTROL_POLL_MS);
+		if (readable < 0)
+			break;
+		if (readable == 0)
+			continue;
+
+		int received = recv(sock, (char *)buffer + buffered, (int)(sizeof(buffer) - buffered), 0);
+		if (received <= 0)
+			break; /* closed by the server, or shut down by scrcpy_join_control_thread() */
+		buffered += (size_t)received;
+
+		size_t pos = 0;
+		bool protocol_error = false;
+		while (pos < buffered) {
+			long consumed = scrcpy_device_msg_parse(buffer + pos, buffered - pos, msg);
+			if (consumed == 0)
+				break; /* incomplete */
+			if (consumed < 0) {
+				protocol_error = true;
+				break;
+			}
+			pos += (size_t)consumed;
+
+			if (msg->kind == SCRCPY_DEVICE_MSG_KIND_CAMERA_CAPABILITIES) {
+				obs_log(LOG_INFO,
+					"camera %s capabilities: flags=0x%x iso=%d..%d exposure=%lld..%lld ns zoom=%.1f..%.1f",
+					msg->caps.camera_id, msg->caps.flags, msg->caps.iso_min, msg->caps.iso_max,
+					(long long)msg->caps.exposure_min_ns, (long long)msg->caps.exposure_max_ns,
+					msg->caps.zoom_min, msg->caps.zoom_max);
+				if (session->on_camera_caps)
+					session->on_camera_caps(session->on_camera_opaque, &msg->caps);
+			} else if (msg->kind == SCRCPY_DEVICE_MSG_KIND_CAMERA_STATE) {
+				if (session->on_camera_state)
+					session->on_camera_state(session->on_camera_opaque, &msg->state);
+			}
+		}
+
+		if (protocol_error) {
+			obs_log(LOG_ERROR, "scrcpy control protocol error (device message type 0x%02x)", buffer[pos]);
+			break;
+		}
+		if (pos == 0 && buffered == sizeof(buffer)) {
+			obs_log(LOG_ERROR, "scrcpy device message too large");
+			break;
+		}
+		memmove(buffer, buffer + pos, buffered - pos);
+		buffered -= pos;
+	}
+
+	bfree(msg);
+	obs_log(LOG_INFO, "scrcpy camera control thread finished");
+	return 0;
+}
+
 static SCRCPY_THREAD_API scrcpy_session_worker(void *opaque)
 {
 	struct scrcpy_session *session = opaque;
@@ -1768,6 +2031,7 @@ static SCRCPY_THREAD_API scrcpy_session_worker(void *opaque)
 	while (!scrcpy_should_stop(session)) {
 		session->video_socket = INVALID_SOCKET;
 		session->audio_socket = INVALID_SOCKET;
+		session->control_socket = INVALID_SOCKET;
 #ifdef _WIN32
 		session->server_process = NULL;
 #else
@@ -1795,10 +2059,11 @@ static SCRCPY_THREAD_API scrcpy_session_worker(void *opaque)
 
 		snprintf(command, sizeof(command),
 			 "%s -s %s shell CLASSPATH=/data/local/tmp/scrcpy-server.jar app_process / "
-			 "com.genymobile.scrcpy.Server %s scid=%08x tunnel_forward=true audio=%s control=false "
+			 "com.genymobile.scrcpy.Server %s scid=%08x tunnel_forward=true audio=%s control=%s "
 			 "video_codec=%s",
 			 session->adb_path, session->device_serial, session->scrcpy_version, session->scid,
-			 session->audio_enabled ? "true" : "false", session->video_codec);
+			 session->audio_enabled ? "true" : "false", session->camera_controls_enabled ? "true" : "false",
+			 session->video_codec);
 
 		{
 			size_t len = strlen(command);
@@ -1846,6 +2111,17 @@ static SCRCPY_THREAD_API scrcpy_session_worker(void *opaque)
 				if (session->camera_high_speed) {
 					len += _snprintf_s(command + len, sizeof(command) - len, _TRUNCATE,
 							   " camera_high_speed=true");
+				}
+				if (session->camera_controls_enabled) {
+					/* Start directly with the desired controls (they are also re-sent once connected,
+					 * to cover changes made during the connection) */
+					struct scrcpy_camera_controls controls;
+					pthread_mutex_lock(&session->controls_mutex);
+					controls = session->camera_controls;
+					pthread_mutex_unlock(&session->controls_mutex);
+					if (!scrcpy_camera_controls_append_params(&controls, command, sizeof(command)))
+						obs_log(LOG_WARNING, "scrcpy server command too long for camera controls");
+					len = strlen(command);
 				}
 			}
 			if (session->audio_enabled) {
@@ -1918,6 +2194,24 @@ static SCRCPY_THREAD_API scrcpy_session_worker(void *opaque)
 					}
 				}
 
+				/* The control socket is accepted last (video, audio, control) */
+				if (session->camera_controls_enabled) {
+					if (!scrcpy_open_control_socket(session)) {
+						if (session->video_socket != INVALID_SOCKET) {
+							shutdown(session->video_socket, SD_BOTH);
+							closesocket(session->video_socket);
+							session->video_socket = INVALID_SOCKET;
+						}
+						if (session->audio_socket != INVALID_SOCKET) {
+							shutdown(session->audio_socket, SD_BOTH);
+							closesocket(session->audio_socket);
+							session->audio_socket = INVALID_SOCKET;
+						}
+						Sleep(500);
+						continue;
+					}
+				}
+
 				if (scrcpy_read_handshake(session, &codec_id, &width, &height)) {
 					handshake_ok = true;
 					ever_connected = true;
@@ -1937,6 +2231,11 @@ static SCRCPY_THREAD_API scrcpy_session_worker(void *opaque)
 					shutdown(session->audio_socket, SD_BOTH);
 					closesocket(session->audio_socket);
 					session->audio_socket = INVALID_SOCKET;
+				}
+				if (session->control_socket != INVALID_SOCKET) {
+					shutdown(session->control_socket, SD_BOTH);
+					closesocket(session->control_socket);
+					session->control_socket = INVALID_SOCKET;
 				}
 				Sleep(500);
 			}
@@ -1975,6 +2274,25 @@ static SCRCPY_THREAD_API scrcpy_session_worker(void *opaque)
 			}
 		}
 
+		if (session->control_socket != INVALID_SOCKET) {
+			/* Send the current controls once connected: they may have changed since the server was launched */
+			pthread_mutex_lock(&session->controls_mutex);
+			session->controls_dirty = true;
+			pthread_mutex_unlock(&session->controls_mutex);
+#ifdef _WIN32
+			uintptr_t control_handle = _beginthreadex(NULL, 0, scrcpy_control_worker, session, 0, NULL);
+			if (control_handle)
+				session->control_thread = (HANDLE)control_handle;
+			else
+				obs_log(LOG_WARNING, "failed to start camera control thread");
+#else
+			if (pthread_create(&session->control_thread, NULL, scrcpy_control_worker, session) != 0) {
+				session->control_thread = 0;
+				obs_log(LOG_WARNING, "failed to start camera control thread");
+			}
+#endif
+		}
+
 		if (!scrcpy_decode_loop(session, decoder_context, width, height))
 			obs_log(LOG_WARNING, "scrcpy decode loop exited due to stream error or decode failure");
 
@@ -1996,6 +2314,7 @@ static SCRCPY_THREAD_API scrcpy_session_worker(void *opaque)
 			session->audio_thread = 0;
 		}
 
+		scrcpy_join_control_thread(session);
 		scrcpy_close_stream_handles(session);
 
 		_snprintf_s(command, sizeof(command), _TRUNCATE, "\"%s\" -s %s forward --remove tcp:%hu",

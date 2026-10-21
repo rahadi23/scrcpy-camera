@@ -21,12 +21,17 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "camera-protocol.h"
+
 struct scrcpy_session;
 struct obs_source_frame;
 struct obs_source_audio;
 
 typedef void (*scrcpy_session_frame_callback)(void *opaque, const struct obs_source_frame *frame);
 typedef void (*scrcpy_session_audio_callback)(void *opaque, const struct obs_source_audio *audio);
+/* Called from the session control thread */
+typedef void (*scrcpy_session_camera_caps_callback)(void *opaque, const struct scrcpy_camera_caps *caps);
+typedef void (*scrcpy_session_camera_state_callback)(void *opaque, const struct scrcpy_camera_state *state);
 
 struct scrcpy_session_config {
 	const char *adb_path;
@@ -52,10 +57,17 @@ struct scrcpy_session_config {
 	 * Higher levels trade jitter tolerance for lower delay by tuning the
 	 * socket receive buffer, decoder flags, and OBS unbuffered async output. */
 	uint8_t low_latency_level;
+	/* Live camera controls (camera source only). Requires the forked server (SCRCPY_CAMCTL_SERVER_VERSION): opens
+	 * the control socket, passes camera_controls as startup parameters, and reports capabilities and state. */
+	bool camera_controls_enabled;
+	struct scrcpy_camera_controls camera_controls;
 	scrcpy_session_frame_callback on_frame;
 	void *on_frame_opaque;
 	scrcpy_session_audio_callback on_audio;
 	void *on_audio_opaque;
+	scrcpy_session_camera_caps_callback on_camera_caps;
+	scrcpy_session_camera_state_callback on_camera_state;
+	void *on_camera_opaque;
 };
 
 struct scrcpy_session *scrcpy_session_create(void);
@@ -64,3 +76,9 @@ void scrcpy_session_destroy(struct scrcpy_session *session);
 int scrcpy_session_start(struct scrcpy_session *session, const struct scrcpy_session_config *config);
 void scrcpy_session_stop(struct scrcpy_session *session);
 bool scrcpy_session_is_running(const struct scrcpy_session *session);
+
+/* Replace the desired camera controls (thread-safe). They are sent to the device if connected (bursts are coalesced),
+ * and used as startup parameters on the next (re)connection. */
+void scrcpy_session_set_camera_controls(struct scrcpy_session *session, const struct scrcpy_camera_controls *controls);
+/* Trigger (SCRCPY_CAMERA_AF_TRIGGER_START) or cancel a one-shot autofocus (thread-safe, ignored if not connected) */
+void scrcpy_session_camera_af_trigger(struct scrcpy_session *session, uint8_t action);
