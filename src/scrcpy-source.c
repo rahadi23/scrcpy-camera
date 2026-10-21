@@ -24,6 +24,7 @@
 #include <plugin-support.h>
 
 #include "camera-controls-props.h"
+#include "camera-list.h"
 #include "scrcpy-session.h"
 #include "scrcpy-source.h"
 
@@ -57,6 +58,10 @@
 #define SETTING_VIDEO_SOURCE "video_source"
 #define SETTING_CAMERA_ID "camera_id"
 #define SETTING_CAMERA_SIZE "camera_size"
+/* Cached output of the server "list_camera_sizes=true" (filled by the "Refresh camera list" button) */
+#define SETTING_CAMERA_LIST "camera_list"
+#define CAMERA_LIST_REMOTE_JAR "/data/local/tmp/scrcpy-server-list.jar"
+#define CAMERA_LIST_TIMEOUT_MS 15000
 #define SETTING_FRAME_RATE "frame_rate"
 #define SETTING_HW_DECODING "hw_decoding"
 #define SETTING_AUDIO_ENABLED "audio_enabled"
@@ -183,6 +188,8 @@ struct scrcpy_source {
 
 static void scrcpy_source_update(void *data, obs_data_t *settings);
 static int scrcpy_refresh_device_list(struct scrcpy_source *context, obs_property_t *list);
+static bool scrcpy_run_adb_command_timeout(const char *adb_path, const char *args, char *output, size_t output_size,
+					   int timeout_ms);
 static bool scrcpy_refresh_button_clicked(obs_properties_t *props, obs_property_t *button, void *data);
 static void scrcpy_source_start_session(struct scrcpy_source *context);
 static void scrcpy_source_tick(void *data, float seconds);
@@ -302,10 +309,13 @@ static void scrcpy_source_update(void *data, obs_data_t *settings)
 	context->audio_source = bstrdup(audio_source && audio_source[0] ? audio_source : "output");
 	context->audio_codec = bstrdup(audio_codec && audio_codec[0] ? audio_codec : "opus");
 
-	/* OBS editable combo box uses the display text. Extract just the ID. */
+	/* The Camera ID used to be an editable combo box, which saved the display text (e.g. "0 (Back)"). Extract just
+	 * the ID, and store it so that the camera list selects it. */
 	char *space = strchr(context->camera_id, ' ');
-	if (space)
+	if (space) {
 		*space = '\0';
+		obs_data_set_string(settings, SETTING_CAMERA_ID, context->camera_id);
+	}
 
 	/*
 	 * Effective serial: picked from the scan list or typed in the manual field,
@@ -466,6 +476,7 @@ static void scrcpy_source_defaults(obs_data_t *settings)
 	obs_data_set_default_string(settings, SETTING_VIDEO_SOURCE, "display");
 	obs_data_set_default_string(settings, SETTING_CAMERA_ID, "0");
 	obs_data_set_default_string(settings, SETTING_CAMERA_SIZE, "1920x1080");
+	obs_data_set_default_string(settings, SETTING_CAMERA_LIST, "");
 	obs_data_set_default_int(settings, SETTING_FRAME_RATE, 0);
 	obs_data_set_default_bool(settings, SETTING_HW_DECODING, true);
 	obs_data_set_default_bool(settings, SETTING_AUDIO_ENABLED, false);
@@ -490,6 +501,178 @@ static void scrcpy_frame_rate_list_fill(obs_property_t *list, bool is_camera)
 	}
 }
 
+/* Parse the cached camera list (empty if the list was never refreshed) */
+static struct camera_list *scrcpy_load_camera_list(obs_data_t *settings)
+{
+	struct camera_list *list = bzalloc(sizeof(*list));
+	const char *text = settings ? obs_data_get_string(settings, SETTING_CAMERA_LIST) : NULL;
+	if (!text || !text[0] || !camera_list_parse(text, list))
+		list->count = 0;
+	return list;
+}
+
+static void scrcpy_camera_id_list_fill(obs_property_t *prop, const struct camera_list *list, const char *current)
+{
+	bool found = false;
+	char label[160];
+
+	obs_property_list_clear(prop);
+	if (list->count > 0) {
+		for (size_t i = 0; i < list->count; ++i) {
+			const struct camera_list_entry *camera = &list->cameras[i];
+			_snprintf_s(label, sizeof(label), _TRUNCATE, "%s (%s)", camera->id, camera->description);
+			obs_property_list_add_string(prop, label, camera->id);
+			if (current && strcmp(current, camera->id) == 0)
+				found = true;
+		}
+	} else {
+		/* Not refreshed yet: typical ids */
+		static const char *const ids[] = {"0", "1", "2", "3"};
+		static const char *const labels[] = {"0 (usually back)", "1 (usually front)", "2", "3"};
+		for (size_t i = 0; i < 4; ++i) {
+			obs_property_list_add_string(prop, labels[i], ids[i]);
+			if (current && strcmp(current, ids[i]) == 0)
+				found = true;
+		}
+	}
+
+	if (!found && current && current[0]) {
+		_snprintf_s(label, sizeof(label), _TRUNCATE, "%s (not in the camera list)", current);
+		obs_property_list_add_string(prop, label, current);
+	}
+}
+
+static int scrcpy_compare_sizes_desc(const void *a, const void *b)
+{
+	const struct camera_list_size *s1 = a;
+	const struct camera_list_size *s2 = b;
+	long long area1 = (long long)s1->width * s1->height;
+	long long area2 = (long long)s2->width * s2->height;
+	if (area1 != area2)
+		return area1 < area2 ? 1 : -1;
+	return (int)s2->width - (int)s1->width;
+}
+
+static void scrcpy_camera_size_list_fill(obs_property_t *prop, const struct camera_list *list, const char *camera_id,
+					 long long frame_rate, const char *current)
+{
+	bool found = false;
+	char value[32];
+	char label[96];
+
+	obs_property_list_clear(prop);
+
+	const struct camera_list_entry *camera = camera_list_find(list, camera_id);
+	if (camera) {
+		/* 120/240 fps use the high-speed capture session, which only supports specific sizes */
+		bool high_speed = frame_rate >= 120;
+		struct camera_list_size sizes[CAMERA_LIST_MAX_SIZES];
+		size_t count = 0;
+		if (high_speed) {
+			for (size_t i = 0; i < camera->high_speed_count; ++i) {
+				if (camera_list_size_has_fps(&camera->high_speed_sizes[i], (int)frame_rate))
+					sizes[count++] = camera->high_speed_sizes[i];
+			}
+		} else {
+			memcpy(sizes, camera->sizes, camera->size_count * sizeof(sizes[0]));
+			count = camera->size_count;
+		}
+		qsort(sizes, count, sizeof(sizes[0]), scrcpy_compare_sizes_desc);
+
+		for (size_t i = 0; i < count; ++i) {
+			_snprintf_s(value, sizeof(value), _TRUNCATE, "%ux%u", (unsigned)sizes[i].width,
+				    (unsigned)sizes[i].height);
+			if (high_speed)
+				_snprintf_s(label, sizeof(label), _TRUNCATE, "%s (%lld fps high-speed)", value, frame_rate);
+			else
+				_snprintf_s(label, sizeof(label), _TRUNCATE, "%s", value);
+			obs_property_list_add_string(prop, label, value);
+			if (current && strcmp(current, value) == 0)
+				found = true;
+		}
+	} else {
+		/* Camera list not refreshed yet: common sizes */
+		static const char *const common[] = {"3840x2160", "1920x1080", "1280x720", "640x480"};
+		for (size_t i = 0; i < 4; ++i) {
+			obs_property_list_add_string(prop, common[i], common[i]);
+			if (current && strcmp(current, common[i]) == 0)
+				found = true;
+		}
+	}
+
+	if (!found && current && current[0]) {
+		_snprintf_s(label, sizeof(label), _TRUNCATE, "%s (%s)", current,
+			    camera ? "not supported by this camera" : "current");
+		obs_property_list_add_string(prop, label, current);
+	}
+}
+
+static void scrcpy_refresh_camera_size_list(obs_properties_t *props, obs_data_t *settings)
+{
+	obs_property_t *size_prop = obs_properties_get(props, SETTING_CAMERA_SIZE);
+	if (!size_prop)
+		return;
+
+	struct camera_list *list = scrcpy_load_camera_list(settings);
+	scrcpy_camera_size_list_fill(size_prop, list, obs_data_get_string(settings, SETTING_CAMERA_ID),
+				     obs_data_get_int(settings, SETTING_FRAME_RATE),
+				     obs_data_get_string(settings, SETTING_CAMERA_SIZE));
+	bfree(list);
+}
+
+static bool scrcpy_camera_id_or_fps_changed(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
+{
+	UNUSED_PARAMETER(p);
+	scrcpy_refresh_camera_size_list(props, settings);
+	return true;
+}
+
+static bool scrcpy_refresh_cameras_clicked(obs_properties_t *props, obs_property_t *button, void *data)
+{
+	UNUSED_PARAMETER(button);
+	struct scrcpy_source *context = data;
+	char args[1024];
+
+	if (!context || !context->device_serial || !context->device_serial[0]) {
+		obs_log(LOG_WARNING, "scrcpy: select an ADB device before refreshing the camera list");
+		return false;
+	}
+
+	/* Push to a separate path: the running session may be using /data/local/tmp/scrcpy-server.jar */
+	_snprintf_s(args, sizeof(args), _TRUNCATE, "-s %s push \"%s\" %s", context->device_serial,
+		    context->server_jar_path, CAMERA_LIST_REMOTE_JAR);
+	if (!scrcpy_run_adb_command_timeout(context->adb_path, args, NULL, 0, CAMERA_LIST_TIMEOUT_MS)) {
+		obs_log(LOG_WARNING, "scrcpy: could not push the server to list the cameras");
+		return false;
+	}
+
+	/* The server deletes its own file after listing (cleanup) */
+	_snprintf_s(args, sizeof(args), _TRUNCATE,
+		    "-s %s shell CLASSPATH=%s app_process / com.genymobile.scrcpy.Server %s list_camera_sizes=true",
+		    context->device_serial, CAMERA_LIST_REMOTE_JAR, context->scrcpy_version);
+	size_t output_size = 64 * 1024;
+	char *output = bzalloc(output_size);
+	bool ok = scrcpy_run_adb_command_timeout(context->adb_path, args, output, output_size, CAMERA_LIST_TIMEOUT_MS);
+
+	struct camera_list *list = bzalloc(sizeof(*list));
+	if (ok && camera_list_parse(output, list) && list->count > 0) {
+		obs_log(LOG_INFO, "scrcpy: found %zu cameras on device '%s'", list->count, context->device_serial);
+		obs_data_t *settings = obs_source_get_settings(context->source);
+		obs_data_set_string(settings, SETTING_CAMERA_LIST, output);
+		obs_property_t *id_prop = obs_properties_get(props, SETTING_CAMERA_ID);
+		if (id_prop)
+			scrcpy_camera_id_list_fill(id_prop, list, obs_data_get_string(settings, SETTING_CAMERA_ID));
+		scrcpy_refresh_camera_size_list(props, settings);
+		obs_data_release(settings);
+	} else {
+		obs_log(LOG_WARNING, "scrcpy: could not list the cameras: %.300s", output);
+	}
+
+	bfree(list);
+	bfree(output);
+	return true;
+}
+
 static bool scrcpy_video_source_changed(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
 {
 	UNUSED_PARAMETER(p);
@@ -499,6 +682,9 @@ static bool scrcpy_video_source_changed(obs_properties_t *props, obs_property_t 
 	obs_property_set_visible(cam_id_prop, is_camera);
 	obs_property_t *cam_size_prop = obs_properties_get(props, SETTING_CAMERA_SIZE);
 	obs_property_set_visible(cam_size_prop, is_camera);
+	obs_property_t *refresh_cameras = obs_properties_get(props, "refresh_cameras");
+	if (refresh_cameras)
+		obs_property_set_visible(refresh_cameras, is_camera);
 	obs_property_t *cam_controls_group = obs_properties_get(props, "cam_controls");
 	if (cam_controls_group)
 		obs_property_set_visible(cam_controls_group, is_camera);
@@ -660,6 +846,8 @@ static obs_properties_t *scrcpy_source_properties(void *unused)
 								  OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
 	scrcpy_frame_rate_list_fill(frame_rate_list,
 				    context && context->video_source && strcmp(context->video_source, "camera") == 0);
+	/* High-speed frame rates only support specific camera sizes */
+	obs_property_set_modified_callback(frame_rate_list, scrcpy_camera_id_or_fps_changed);
 	obs_property_set_long_description(
 		frame_rate_list, "Screen: caps the encoder frame rate. Camera: sets the camera capture frame rate. "
 				 "Note that a camera app which can record 60 fps does not guarantee scrcpy can "
@@ -669,14 +857,34 @@ static obs_properties_t *scrcpy_source_properties(void *unused)
 				 "only work at device-advertised size/fps combinations; you may need a smaller "
 				 "Camera Size (e.g. 1280x720 for 240 fps) and a higher video bitrate.");
 
-	cam_id_prop = obs_properties_add_list(props, SETTING_CAMERA_ID, "Camera ID", OBS_COMBO_TYPE_EDITABLE,
-					      OBS_COMBO_FORMAT_STRING);
-	obs_property_list_add_string(cam_id_prop, "0 (Back)", "0");
-	obs_property_list_add_string(cam_id_prop, "1 (Front)", "1");
-	obs_property_list_add_string(cam_id_prop, "2", "2");
-	obs_property_list_add_string(cam_id_prop, "3", "3");
+	{
+		/* Camera ID and size lists, from the camera list cached by "Refresh camera list" */
+		obs_data_t *settings = context ? obs_source_get_settings(context->source) : NULL;
+		struct camera_list *camera_list = scrcpy_load_camera_list(settings);
 
-	obs_properties_add_text(props, SETTING_CAMERA_SIZE, "Camera Size", OBS_TEXT_DEFAULT);
+		cam_id_prop = obs_properties_add_list(props, SETTING_CAMERA_ID, "Camera ID", OBS_COMBO_TYPE_LIST,
+						      OBS_COMBO_FORMAT_STRING);
+		scrcpy_camera_id_list_fill(cam_id_prop, camera_list, context ? context->camera_id : "0");
+		obs_property_set_modified_callback(cam_id_prop, scrcpy_camera_id_or_fps_changed);
+		obs_property_set_long_description(cam_id_prop, "Click \"Refresh camera list\" to list the cameras of the "
+							       "device, with their supported sizes.");
+
+		obs_properties_add_button2(props, "refresh_cameras", "Refresh camera list", scrcpy_refresh_cameras_clicked,
+					   context);
+
+		obs_property_t *cam_size_prop = obs_properties_add_list(props, SETTING_CAMERA_SIZE, "Camera Size",
+									OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+		scrcpy_camera_size_list_fill(cam_size_prop, camera_list, context ? context->camera_id : "0",
+					     settings ? obs_data_get_int(settings, SETTING_FRAME_RATE) : 0,
+					     context ? context->camera_size : NULL);
+		obs_property_set_long_description(cam_size_prop,
+						  "The sizes supported by the selected camera (only the high-speed sizes "
+						  "at 120/240 fps). Click \"Refresh camera list\" if the list is empty "
+						  "or shows generic sizes.");
+
+		bfree(camera_list);
+		obs_data_release(settings);
+	}
 
 	{
 		struct camctl_device_info info = {0};
@@ -968,7 +1176,16 @@ static int scrcpy_parse_adb_devices(FILE *pipe, obs_property_t *list)
 
 	return scrcpy_parse_adb_devices_from_string(output, list, NULL, NULL);
 }
+static bool scrcpy_run_adb_command_timeout(const char *adb_path, const char *args, char *output, size_t output_size,
+					   int timeout_ms);
+
 static bool scrcpy_run_adb_command(const char *adb_path, const char *args, char *output, size_t output_size)
+{
+	return scrcpy_run_adb_command_timeout(adb_path, args, output, output_size, ADB_CMD_TIMEOUT_MS);
+}
+
+static bool scrcpy_run_adb_command_timeout(const char *adb_path, const char *args, char *output, size_t output_size,
+					   int timeout_ms)
 {
 	char command[1024];
 
@@ -979,10 +1196,11 @@ static bool scrcpy_run_adb_command(const char *adb_path, const char *args, char 
 	PROCESS_INFORMATION pi;
 	HANDLE stdout_read = NULL, stdout_write = NULL;
 	SECURITY_ATTRIBUTES sa;
-	DWORD wait_result;
 	bool ok = false;
 
-	_snprintf_s(command, sizeof(command), _TRUNCATE, "cmd.exe /c \"%s\" %s 2>nul", adb_path, args);
+	/* cmd /c strips the first and the last quote of the command line when it contains more than two quotes (e.g. a
+	 * quoted path in args): wrap the whole command in an extra pair of quotes */
+	_snprintf_s(command, sizeof(command), _TRUNCATE, "cmd.exe /c \"\"%s\" %s 2>nul\"", adb_path, args);
 
 	ZeroMemory(&sa, sizeof(sa));
 	sa.nLength = sizeof(sa);
@@ -1012,29 +1230,42 @@ static bool scrcpy_run_adb_command(const char *adb_path, const char *args, char 
 	}
 	CloseHandle(pi.hThread);
 
-	wait_result = WaitForSingleObject(pi.hProcess, ADB_CMD_TIMEOUT_MS);
-	if (wait_result == WAIT_TIMEOUT) {
-		TerminateProcess(pi.hProcess, 1);
-		obs_log(LOG_WARNING, "scrcpy: adb command timed out after %d ms: %s", ADB_CMD_TIMEOUT_MS, args);
-	} else {
-		ok = true;
-	}
-
-	if (stdout_read) {
-		DWORD available = 0, bytes_read = 0;
-		size_t total = 0;
-		Sleep(30); /* let adb stdout flush */
-		while (total < output_size - 1 && PeekNamedPipe(stdout_read, NULL, 0, NULL, &available, NULL) &&
-		       available > 0) {
-			DWORD to_read = (DWORD)(output_size - 1 - total);
-			if (to_read > available)
-				to_read = available;
-			if (!ReadFile(stdout_read, output + total, to_read, &bytes_read, NULL) || bytes_read == 0)
-				break;
-			total += bytes_read;
+	/*
+	 * Read the output while waiting: if the output exceeds the pipe buffer, the process blocks on write until the
+	 * pipe is read, so reading only after the process exits would end in a timeout.
+	 */
+	size_t total = 0;
+	uint64_t deadline = os_gettime_ns() + (uint64_t)timeout_ms * 1000000ULL;
+	for (;;) {
+		DWORD wait_result = WaitForSingleObject(pi.hProcess, 20);
+		if (stdout_read) {
+			DWORD available = 0, bytes_read = 0;
+			if (wait_result == WAIT_OBJECT_0)
+				Sleep(30); /* let adb stdout flush */
+			while (PeekNamedPipe(stdout_read, NULL, 0, NULL, &available, NULL) && available > 0) {
+				char discard[512];
+				char *dst = total < output_size - 1 ? output + total : discard;
+				DWORD capacity = total < output_size - 1 ? (DWORD)(output_size - 1 - total)
+									 : (DWORD)sizeof(discard);
+				DWORD to_read = available < capacity ? available : capacity;
+				if (!ReadFile(stdout_read, dst, to_read, &bytes_read, NULL) || bytes_read == 0)
+					break;
+				if (dst != discard)
+					total += bytes_read;
+			}
 		}
-		output[total] = '\0';
+		if (wait_result == WAIT_OBJECT_0) {
+			ok = true;
+			break;
+		}
+		if (os_gettime_ns() >= deadline) {
+			TerminateProcess(pi.hProcess, 1);
+			obs_log(LOG_WARNING, "scrcpy: adb command timed out after %d ms: %s", timeout_ms, args);
+			break;
+		}
 	}
+	if (output && output_size > 0)
+		output[total] = '\0';
 
 	if (stdout_write)
 		CloseHandle(stdout_write);
@@ -1043,6 +1274,7 @@ static bool scrcpy_run_adb_command(const char *adb_path, const char *args, char 
 	CloseHandle(pi.hProcess);
 	return ok;
 #else
+	UNUSED_PARAMETER(timeout_ms);
 	/* POSIX: run adb and capture stdout via a pipe. */
 	FILE *pipe = popen(command, "r");
 	if (!pipe) {
@@ -1060,6 +1292,10 @@ static bool scrcpy_run_adb_command(const char *adb_path, const char *args, char 
 		}
 		output[total] = '\0';
 	}
+	/* Drain the remaining output, otherwise the process could block on write and pclose() would never return */
+	char discard[512];
+	while (fread(discard, 1, sizeof(discard), pipe) > 0)
+		;
 
 	int status = pclose(pipe);
 	return (status >= 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0);

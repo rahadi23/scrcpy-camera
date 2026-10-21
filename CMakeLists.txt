@@ -54,6 +54,7 @@ target_sources(
     src/scrcpy-source.c
     src/camera-protocol.c
     src/camera-controls-props.c
+    src/camera-list.c
 )
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
